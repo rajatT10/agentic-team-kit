@@ -15,6 +15,154 @@ test suite before any code gets written.
 | [`dev-task-split`](.claude/skills/dev-task-split/SKILL.md) | Turns `design.md` into `tasks.json`: an ordered task list with explicit file ownership, so parallel work is only ever attempted when disjoint file sets prove it's safe. |
 | [`qa-test-plan`](.claude/skills/qa-test-plan/SKILL.md) | Turns an *approved* `requirements.md` into a failing test suite, one test per acceptance criterion — a dev agent's exit condition, never a prose bug report. |
 
+## The orchestrator
+
+`orchestrator/` is the write-work half: plain Python, no model in the loop. It reads a
+task plan and decides what may run concurrently — and refuses the plan when that can't be
+established.
+
+```console
+$ python3 -m orchestrator validate docs/features/dark-mode/tasks.json
+T1 and T2 both own overlapping paths ('src/api/**' ∩ 'src/api/users.ts') but neither depends on the other
+
+$ python3 -m orchestrator schedule docs/features/dark-mode/tasks.json
+dark-mode: 4 tasks in 3 wave(s), max concurrency 2 (mode: parallel)
+
+  wave 0 (parallel):
+    T1  Theme tokens + provider
+      owns:     src/theme/**
+      worktree: .worktrees/dark-mode-t1  branch: agent/dark-mode-t1
+    ...
+```
+
+Both commands exit non-zero on an unsafe plan, so this belongs in CI between
+`dev-task-split` and any agent writing code.
+
+- **Glob intersection is exact, not filesystem-based.** Two `owns` globs are compiled to
+  NFAs and walked as a product automaton, so the check covers files a task will *create* —
+  which are the ones that actually collide. Expanding globs against files already on disk
+  would miss them entirely.
+- **Waves are derived, not declared.** Tasks share a wave only when the DAG puts no edge
+  between them, and validation has already proven no-edge implies no shared files. `mode`
+  can narrow the schedule but never widen it past what the globs allow.
+- **Spec Kit plans import too.** `tasks.md` is read as a lossy import: file ownership is
+  recovered from the task description, non-`[P]` tasks are treated as phase barriers, and
+  a task naming no file is given `**` so it is scheduled alone rather than assumed safe.
+
+## Running the dev agents
+
+`orchestrator run` executes the schedule: a git worktree per task, agents in parallel
+within a wave, tests as the exit condition.
+
+```console
+$ python3 -m orchestrator init          # writes .agentteam/config.json
+$ python3 -m orchestrator run docs/features/dark-mode/tasks.json
+
+wave 0: T1, T2
+  T2 round 1: pass
+  T1 round 1: pass
+
+wave 1: T3
+  T3 round 1: pass
+
+dark-mode: 3/3 tasks ok on agent/integration
+```
+
+**The agent is a command template, not an SDK.** Nothing here imports a vendor library —
+the runner renders a command and runs it as a subprocess, so the same task plan drives
+Claude Code, Cursor, Antigravity, Codex or a shell script, and switching is a config edit:
+
+```json
+{
+  "agent":  { "preset": "claude", "timeout_seconds": 1800 },
+  "verify": { "manifest": "docs/features/dark-mode/test-manifest.json" },
+  "policy": { "max_rounds": 3, "max_concurrency": 4 }
+}
+```
+
+Presets: `claude`, `cursor`, `codex`, `gemini`, `echo`. Anything else goes in `command` as
+argv parts, one containing `{prompt}`.
+
+How a task finishes:
+
+| Status | Meaning |
+|---|---|
+| `completed` | verification passed, merged into the integration branch |
+| `held` | verification passed, but `requires_human_review` withheld the merge |
+| `failed` | rounds exhausted with tests still failing |
+| `escalated` | failed identically twice — a human is faster than a third round |
+| `conflicted` | verified, but would not merge — something outside `owns` was touched |
+| `errored` | the agent could not be run (missing CLI, timeout) |
+| `skipped` | an earlier wave stopped the run |
+
+- **Tests decide, not the agent.** With a `verify.manifest`, a task's exit condition is
+  the tests for its own `covers` list plus every `green` regression test — so a task
+  cannot pass because some unrelated test went green. With neither a manifest nor a
+  command the run is refused rather than assumed passing.
+- **Failure output goes back into the next round's prompt**, bounded by `max_rounds`. The
+  same failure twice escalates instead of burning a third round; the signature ignores
+  timings, temp paths and addresses so ordinary noise doesn't read as progress. A missing
+  agent binary errors immediately.
+- **Merges happen after the whole wave finishes**, never as each agent lands, so the
+  integration branch does not move under the others. A conflict there is a finding, not
+  routine: disjointness was already proven, so it means something outside `owns` was
+  edited — a lockfile, a generated file, a shared registry.
+
+## QA: acceptance criteria as the exit condition
+
+`test-manifest.json` maps each `AC-n` to one test, which is what turns "the suite passed"
+into "AC-3 passed". Loading it validates the mapping up front — a duplicated criterion, a
+command with no `{test}` placeholder, or a status that isn't `red`/`green` stops the run
+before any agent is dispatched.
+
+```console
+$ python3 -m orchestrator run docs/features/dark-mode/tasks.json --describe PR.md
+verify: per acceptance criterion, from docs/features/dark-mode/test-manifest.json
+```
+
+A task covering a criterion the manifest has no test for fails loudly — there is nothing
+that could prove it done. When QA files a bug mid-loop it becomes a new manifest entry
+with its `found_in_round`, never a prose report.
+
+## The pull request description
+
+`--describe` writes the run up as a PR body: every task with its `owns` globs and outcome,
+an `AC-n` table merged across tasks, the diff summary, and a **Not ready to merge** section
+for anything failed, escalated, conflicted or held.
+
+It is generated from the run record rather than by an agent. Everything a reviewer needs is
+already known by the time the run ends, and a paraphrasing step that can be wrong does not
+belong in front of the one artifact a human reads before approving agent-written code.
+
+## Loading in Cursor, Antigravity and the rest
+
+The skills are the source of truth; the per-tool shims are generated.
+
+```console
+$ python3 tools/sync_agent_files.py          # write
+$ python3 tools/sync_agent_files.py --check  # fail if stale (CI runs this)
+```
+
+| Generated | Read by |
+|---|---|
+| `.cursor/commands/<name>.md` | Cursor slash commands |
+| `AGENTS.md` | Cursor, Antigravity, Codex, Copilot, Gemini CLI, and others |
+
+Hand-writing each tool's format is how copies drift: someone fixes a rule in the Cursor
+version, nobody ports it back, and two agents start giving different answers about the same
+repository. One source, regenerated, cannot drift — and CI fails the build if a `SKILL.md`
+changed without a regenerate.
+
+See [`docs/spec-kit-evaluation.md`](docs/spec-kit-evaluation.md) for how this compares to
+GitHub Spec Kit's `implement` step.
+
+```console
+$ python3 -m unittest discover -s tests
+```
+
+The runner's tests use a shell script as the agent, so the whole loop — worktrees, rounds,
+verification, merge — is covered without an API key or a network.
+
 ## How they fit together
 
 This is read work vs. write work: everything below is read work (independent analyses that merge
@@ -39,8 +187,9 @@ after the gate and isn't covered by this kit yet.
 6. **`qa-test-plan`** (after the gate) → a failing test per acceptance criterion, plus
    `docs/features/<slug>/test-manifest.json` mapping `AC-n` → test. This is also how QA reports
    bugs mid-loop later: a new failing test, never a written description.
-7. Dev agents, a QA-run step, and a reviewer that turns the diff into a PR description are the
-   write-work phases that consume the above — not covered by this kit yet.
+7. **`orchestrator`** validates `tasks.json`, schedules it into waves, runs the dev agents
+   against it — worktree per task, acceptance criteria as the exit condition, bounded
+   retries, merge on green — and writes the run up as a pull request description.
 
 ## Layout
 
@@ -64,6 +213,29 @@ after the gate and isn't covered by this kit yet.
   qa-test-plan/
     SKILL.md
     references/test-manifest-schema.md  # the test-manifest.json contract
+
+orchestrator/
+  globset.py    # exact glob intersection (NFA product) — the `owns` collision test
+  model.py      # Task / Plan, and the invariants that make a plan well-formed
+  parse.py      # tasks.json, plus a lossy import of Spec Kit's tasks.md
+  validate.py   # overlapping owns without a dependency edge = refuse to run
+  schedule.py   # waves, worktrees, branches
+  worktree.py   # git worktree lifecycle + merge-back
+  agent.py      # command-template agent invocation, and the dev-agent brief
+  config.py     # .agentteam/config.json — which agent, which tests, how many rounds
+  manifest.py   # test-manifest.json: AC-n -> test, and failure signatures
+  runner.py     # the wave loop: dispatch, verify, retry, merge
+  review.py     # run record -> pull request description
+  cli.py        # python -m orchestrator validate|schedule|run|init
+
+tools/
+  sync_agent_files.py    # .claude/skills/ -> .cursor/commands/ + AGENTS.md
+
+tests/
+  test_orchestrator.py     # planning: globs, validation, scheduling, parsing
+  test_runner.py           # execution, with a shell script standing in for the agent
+  test_manifest.py         # per-acceptance-criterion verification
+  test_review_and_sync.py  # PR description, and the generated shims staying current
 ```
 
 ## Repository context files

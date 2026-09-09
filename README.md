@@ -49,12 +49,71 @@ Both commands exit non-zero on an unsafe plan, so this belongs in CI between
   recovered from the task description, non-`[P]` tasks are treated as phase barriers, and
   a task naming no file is given `**` so it is scheduled alone rather than assumed safe.
 
-See [`docs/spec-kit-evaluation.md`](docs/spec-kit-evaluation.md) for how this relates to
-GitHub Spec Kit, and why the recommendation is to extend it rather than rebuild it.
+## Running the dev agents
+
+`orchestrator run` executes the schedule: a git worktree per task, agents in parallel
+within a wave, tests as the exit condition.
+
+```console
+$ python3 -m orchestrator init          # writes .agentteam/config.json
+$ python3 -m orchestrator run docs/features/dark-mode/tasks.json
+
+wave 0: T1, T2
+  T2 round 1: pass
+  T1 round 1: pass
+
+wave 1: T3
+  T3 round 1: pass
+
+dark-mode: 3/3 tasks ok on agent/integration
+```
+
+**The agent is a command template, not an SDK.** Nothing here imports a vendor library —
+the runner renders a command and runs it as a subprocess, so the same task plan drives
+Claude Code, Cursor, Antigravity, Codex or a shell script, and switching is a config edit:
+
+```json
+{
+  "agent":  { "preset": "claude", "timeout_seconds": 1800 },
+  "verify": { "command": ["python3", "-m", "pytest", "-q"] },
+  "policy": { "max_rounds": 3, "max_concurrency": 4 }
+}
+```
+
+Presets: `claude`, `cursor`, `codex`, `gemini`, `echo`. Anything else goes in `command` as
+argv parts, one containing `{prompt}`.
+
+How a task finishes:
+
+| Status | Meaning |
+|---|---|
+| `completed` | verification passed, merged into the integration branch |
+| `held` | verification passed, but `requires_human_review` withheld the merge |
+| `failed` | rounds exhausted with tests still failing |
+| `conflicted` | verified, but would not merge — something outside `owns` was touched |
+| `errored` | the agent could not be run (missing CLI, timeout) |
+| `skipped` | an earlier wave stopped the run |
+
+- **Tests decide, not the agent.** A task is done when the verification command exits
+  zero. With no `verify.command` configured the run is refused rather than assumed
+  passing — there would be no way to tell whether anything worked.
+- **Failure output goes back into the next round's prompt**, bounded by `max_rounds`. A
+  missing agent binary errors immediately instead of burning every round on the same
+  error.
+- **Merges happen after the whole wave finishes**, never as each agent lands, so the
+  integration branch does not move under the others. A conflict there is a finding, not
+  routine: disjointness was already proven, so it means something outside `owns` was
+  edited — a lockfile, a generated file, a shared registry.
+
+See [`docs/spec-kit-evaluation.md`](docs/spec-kit-evaluation.md) for how this compares to
+GitHub Spec Kit's `implement` step.
 
 ```console
 $ python3 -m unittest discover -s tests
 ```
+
+The runner's tests use a shell script as the agent, so the whole loop — worktrees, rounds,
+verification, merge — is covered without an API key or a network.
 
 ## How they fit together
 
@@ -80,9 +139,10 @@ after the gate and isn't covered by this kit yet.
 6. **`qa-test-plan`** (after the gate) → a failing test per acceptance criterion, plus
    `docs/features/<slug>/test-manifest.json` mapping `AC-n` → test. This is also how QA reports
    bugs mid-loop later: a new failing test, never a written description.
-7. **`orchestrator`** validates `tasks.json` and schedules it into waves. Dev agents, a
-   QA-run step, and a reviewer that turns the diff into a PR description are the write-work
-   phases that consume that schedule — the dev-agent runner is not built yet.
+7. **`orchestrator`** validates `tasks.json`, schedules it into waves, and runs the dev
+   agents against it — worktree per task, tests as the exit condition, bounded retries,
+   merge on green. A QA-run step that maps `AC-n` to pass/fail, and a reviewer that turns
+   the diff into a PR description, are the remaining write-work phases.
 
 ## Layout
 
@@ -113,10 +173,15 @@ orchestrator/
   parse.py      # tasks.json, plus a lossy import of Spec Kit's tasks.md
   validate.py   # overlapping owns without a dependency edge = refuse to run
   schedule.py   # waves, worktrees, branches
-  cli.py        # python -m orchestrator validate|schedule
+  worktree.py   # git worktree lifecycle + merge-back
+  agent.py      # command-template agent invocation, and the dev-agent brief
+  config.py     # .agentteam/config.json — which agent, which tests, how many rounds
+  runner.py     # the wave loop: dispatch, verify, retry, merge
+  cli.py        # python -m orchestrator validate|schedule|run|init
 
 tests/
-  test_orchestrator.py   # stdlib unittest, no install required
+  test_orchestrator.py   # planning: globs, validation, scheduling, parsing
+  test_runner.py         # execution, with a shell script standing in for the agent
 ```
 
 ## Repository context files

@@ -11,8 +11,10 @@ import json
 import sys
 from dataclasses import asdict
 
+from .config import ConfigError, load_config, write_template
 from .model import PlanError
 from .parse import load_plan
+from .runner import Status, run_feature
 from .schedule import build_schedule
 from .validate import validate
 
@@ -43,14 +45,36 @@ def main(argv: list[str] | None = None) -> int:
         help="directory the per-task worktrees are created under (default: .worktrees)",
     )
 
+    execute = subcommands.add_parser(
+        "run", help="dispatch dev agents wave by wave and verify each task"
+    )
+    execute.add_argument("plan", help="path to tasks.json or tasks.md")
+    execute.add_argument("--json", action="store_true", help="machine-readable output")
+    execute.add_argument("--config", default=None, help="path to config.json")
+    execute.add_argument("--repo", default=".", help="repository root (default: .)")
+
+    init = subcommands.add_parser(
+        "init", help="write a starter .agentteam/config.json"
+    )
+    init.add_argument(
+        "--path", default=None, help="where to write it (default: .agentteam/config.json)"
+    )
+
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "init":
+            written = write_template(args.path) if args.path else write_template()
+            print(f"wrote {written}")
+            return 0
+
         plan = load_plan(args.plan)
         if args.command == "validate":
             return _run_validate(plan, as_json=args.json)
-        return _run_schedule(plan, args.worktree_root, as_json=args.json)
-    except PlanError as exc:
+        if args.command == "schedule":
+            return _run_schedule(plan, args.worktree_root, as_json=args.json)
+        return _run_execute(plan, args, as_json=args.json)
+    except (PlanError, ConfigError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         else:
@@ -118,6 +142,67 @@ def _run_schedule(plan, worktree_root: str, *, as_json: bool) -> int:
             print(f"      owns:     {', '.join(assignment.owns)}")
             print(f"      worktree: {assignment.worktree}  branch: {assignment.branch}")
     return 0
+
+
+def _run_execute(plan, args, *, as_json: bool) -> int:
+    config = load_config(args.config)
+
+    def report(event: str, **payload) -> None:
+        if as_json:
+            return
+        if event == "wave-start":
+            wave = payload["wave"]
+            names = ", ".join(a.task_id for a in wave.assignments)
+            print(f"\nwave {wave.index}: {names}", flush=True)
+        elif event == "round-end":
+            mark = "pass" if payload["passed"] else "fail"
+            print(
+                f"  {payload['task_id']} round {payload['round']}: {mark}", flush=True
+            )
+        elif event == "merge-conflict":
+            print(f"  {payload['outcome'].task_id}: merge conflict", flush=True)
+
+    if not as_json:
+        print(
+            f"agent:  {' '.join(config.agent.command)}\n"
+            f"verify: {config.verify_display() or '(none configured)'}\n"
+            f"config: {config.source}"
+        )
+
+    result = run_feature(plan, config, repo=args.repo, on_event=report)
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": result.ok,
+                    "feature": result.feature,
+                    "integration_branch": result.integration_branch,
+                    "tasks": [
+                        {
+                            "task_id": outcome.task_id,
+                            "status": outcome.status.value,
+                            "rounds": outcome.rounds,
+                            "branch": outcome.branch,
+                            "head": outcome.head,
+                            "detail": outcome.detail,
+                        }
+                        for outcome in result.outcomes
+                    ],
+                },
+                indent=2,
+            )
+        )
+    else:
+        print("\n" + result.summary())
+        held = [o for o in result.outcomes if o.status is Status.HELD]
+        if held:
+            print(
+                "\nheld for human review before merge: "
+                + ", ".join(o.task_id for o in held)
+            )
+
+    return 0 if result.ok else 1
 
 
 if __name__ == "__main__":

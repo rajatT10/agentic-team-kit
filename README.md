@@ -15,6 +15,47 @@ test suite before any code gets written.
 | [`dev-task-split`](.claude/skills/dev-task-split/SKILL.md) | Turns `design.md` into `tasks.json`: an ordered task list with explicit file ownership, so parallel work is only ever attempted when disjoint file sets prove it's safe. |
 | [`qa-test-plan`](.claude/skills/qa-test-plan/SKILL.md) | Turns an *approved* `requirements.md` into a failing test suite, one test per acceptance criterion — a dev agent's exit condition, never a prose bug report. |
 
+## The orchestrator
+
+`orchestrator/` is the write-work half: plain Python, no model in the loop. It reads a
+task plan and decides what may run concurrently — and refuses the plan when that can't be
+established.
+
+```console
+$ python3 -m orchestrator validate docs/features/dark-mode/tasks.json
+T1 and T2 both own overlapping paths ('src/api/**' ∩ 'src/api/users.ts') but neither depends on the other
+
+$ python3 -m orchestrator schedule docs/features/dark-mode/tasks.json
+dark-mode: 4 tasks in 3 wave(s), max concurrency 2 (mode: parallel)
+
+  wave 0 (parallel):
+    T1  Theme tokens + provider
+      owns:     src/theme/**
+      worktree: .worktrees/dark-mode-t1  branch: agent/dark-mode-t1
+    ...
+```
+
+Both commands exit non-zero on an unsafe plan, so this belongs in CI between
+`dev-task-split` and any agent writing code.
+
+- **Glob intersection is exact, not filesystem-based.** Two `owns` globs are compiled to
+  NFAs and walked as a product automaton, so the check covers files a task will *create* —
+  which are the ones that actually collide. Expanding globs against files already on disk
+  would miss them entirely.
+- **Waves are derived, not declared.** Tasks share a wave only when the DAG puts no edge
+  between them, and validation has already proven no-edge implies no shared files. `mode`
+  can narrow the schedule but never widen it past what the globs allow.
+- **Spec Kit plans import too.** `tasks.md` is read as a lossy import: file ownership is
+  recovered from the task description, non-`[P]` tasks are treated as phase barriers, and
+  a task naming no file is given `**` so it is scheduled alone rather than assumed safe.
+
+See [`docs/spec-kit-evaluation.md`](docs/spec-kit-evaluation.md) for how this relates to
+GitHub Spec Kit, and why the recommendation is to extend it rather than rebuild it.
+
+```console
+$ python3 -m unittest discover -s tests
+```
+
 ## How they fit together
 
 This is read work vs. write work: everything below is read work (independent analyses that merge
@@ -39,8 +80,9 @@ after the gate and isn't covered by this kit yet.
 6. **`qa-test-plan`** (after the gate) → a failing test per acceptance criterion, plus
    `docs/features/<slug>/test-manifest.json` mapping `AC-n` → test. This is also how QA reports
    bugs mid-loop later: a new failing test, never a written description.
-7. Dev agents, a QA-run step, and a reviewer that turns the diff into a PR description are the
-   write-work phases that consume the above — not covered by this kit yet.
+7. **`orchestrator`** validates `tasks.json` and schedules it into waves. Dev agents, a
+   QA-run step, and a reviewer that turns the diff into a PR description are the write-work
+   phases that consume that schedule — the dev-agent runner is not built yet.
 
 ## Layout
 
@@ -64,6 +106,17 @@ after the gate and isn't covered by this kit yet.
   qa-test-plan/
     SKILL.md
     references/test-manifest-schema.md  # the test-manifest.json contract
+
+orchestrator/
+  globset.py    # exact glob intersection (NFA product) — the `owns` collision test
+  model.py      # Task / Plan, and the invariants that make a plan well-formed
+  parse.py      # tasks.json, plus a lossy import of Spec Kit's tasks.md
+  validate.py   # overlapping owns without a dependency edge = refuse to run
+  schedule.py   # waves, worktrees, branches
+  cli.py        # python -m orchestrator validate|schedule
+
+tests/
+  test_orchestrator.py   # stdlib unittest, no install required
 ```
 
 ## Repository context files

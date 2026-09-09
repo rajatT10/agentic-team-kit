@@ -75,7 +75,7 @@ Claude Code, Cursor, Antigravity, Codex or a shell script, and switching is a co
 ```json
 {
   "agent":  { "preset": "claude", "timeout_seconds": 1800 },
-  "verify": { "command": ["python3", "-m", "pytest", "-q"] },
+  "verify": { "manifest": "docs/features/dark-mode/test-manifest.json" },
   "policy": { "max_rounds": 3, "max_concurrency": 4 }
 }
 ```
@@ -90,20 +90,68 @@ How a task finishes:
 | `completed` | verification passed, merged into the integration branch |
 | `held` | verification passed, but `requires_human_review` withheld the merge |
 | `failed` | rounds exhausted with tests still failing |
+| `escalated` | failed identically twice — a human is faster than a third round |
 | `conflicted` | verified, but would not merge — something outside `owns` was touched |
 | `errored` | the agent could not be run (missing CLI, timeout) |
 | `skipped` | an earlier wave stopped the run |
 
-- **Tests decide, not the agent.** A task is done when the verification command exits
-  zero. With no `verify.command` configured the run is refused rather than assumed
-  passing — there would be no way to tell whether anything worked.
-- **Failure output goes back into the next round's prompt**, bounded by `max_rounds`. A
-  missing agent binary errors immediately instead of burning every round on the same
-  error.
+- **Tests decide, not the agent.** With a `verify.manifest`, a task's exit condition is
+  the tests for its own `covers` list plus every `green` regression test — so a task
+  cannot pass because some unrelated test went green. With neither a manifest nor a
+  command the run is refused rather than assumed passing.
+- **Failure output goes back into the next round's prompt**, bounded by `max_rounds`. The
+  same failure twice escalates instead of burning a third round; the signature ignores
+  timings, temp paths and addresses so ordinary noise doesn't read as progress. A missing
+  agent binary errors immediately.
 - **Merges happen after the whole wave finishes**, never as each agent lands, so the
   integration branch does not move under the others. A conflict there is a finding, not
   routine: disjointness was already proven, so it means something outside `owns` was
   edited — a lockfile, a generated file, a shared registry.
+
+## QA: acceptance criteria as the exit condition
+
+`test-manifest.json` maps each `AC-n` to one test, which is what turns "the suite passed"
+into "AC-3 passed". Loading it validates the mapping up front — a duplicated criterion, a
+command with no `{test}` placeholder, or a status that isn't `red`/`green` stops the run
+before any agent is dispatched.
+
+```console
+$ python3 -m orchestrator run docs/features/dark-mode/tasks.json --describe PR.md
+verify: per acceptance criterion, from docs/features/dark-mode/test-manifest.json
+```
+
+A task covering a criterion the manifest has no test for fails loudly — there is nothing
+that could prove it done. When QA files a bug mid-loop it becomes a new manifest entry
+with its `found_in_round`, never a prose report.
+
+## The pull request description
+
+`--describe` writes the run up as a PR body: every task with its `owns` globs and outcome,
+an `AC-n` table merged across tasks, the diff summary, and a **Not ready to merge** section
+for anything failed, escalated, conflicted or held.
+
+It is generated from the run record rather than by an agent. Everything a reviewer needs is
+already known by the time the run ends, and a paraphrasing step that can be wrong does not
+belong in front of the one artifact a human reads before approving agent-written code.
+
+## Loading in Cursor, Antigravity and the rest
+
+The skills are the source of truth; the per-tool shims are generated.
+
+```console
+$ python3 tools/sync_agent_files.py          # write
+$ python3 tools/sync_agent_files.py --check  # fail if stale (CI runs this)
+```
+
+| Generated | Read by |
+|---|---|
+| `.cursor/commands/<name>.md` | Cursor slash commands |
+| `AGENTS.md` | Cursor, Antigravity, Codex, Copilot, Gemini CLI, and others |
+
+Hand-writing each tool's format is how copies drift: someone fixes a rule in the Cursor
+version, nobody ports it back, and two agents start giving different answers about the same
+repository. One source, regenerated, cannot drift — and CI fails the build if a `SKILL.md`
+changed without a regenerate.
 
 See [`docs/spec-kit-evaluation.md`](docs/spec-kit-evaluation.md) for how this compares to
 GitHub Spec Kit's `implement` step.
@@ -139,10 +187,9 @@ after the gate and isn't covered by this kit yet.
 6. **`qa-test-plan`** (after the gate) → a failing test per acceptance criterion, plus
    `docs/features/<slug>/test-manifest.json` mapping `AC-n` → test. This is also how QA reports
    bugs mid-loop later: a new failing test, never a written description.
-7. **`orchestrator`** validates `tasks.json`, schedules it into waves, and runs the dev
-   agents against it — worktree per task, tests as the exit condition, bounded retries,
-   merge on green. A QA-run step that maps `AC-n` to pass/fail, and a reviewer that turns
-   the diff into a PR description, are the remaining write-work phases.
+7. **`orchestrator`** validates `tasks.json`, schedules it into waves, runs the dev agents
+   against it — worktree per task, acceptance criteria as the exit condition, bounded
+   retries, merge on green — and writes the run up as a pull request description.
 
 ## Layout
 
@@ -176,12 +223,19 @@ orchestrator/
   worktree.py   # git worktree lifecycle + merge-back
   agent.py      # command-template agent invocation, and the dev-agent brief
   config.py     # .agentteam/config.json — which agent, which tests, how many rounds
+  manifest.py   # test-manifest.json: AC-n -> test, and failure signatures
   runner.py     # the wave loop: dispatch, verify, retry, merge
+  review.py     # run record -> pull request description
   cli.py        # python -m orchestrator validate|schedule|run|init
 
+tools/
+  sync_agent_files.py    # .claude/skills/ -> .cursor/commands/ + AGENTS.md
+
 tests/
-  test_orchestrator.py   # planning: globs, validation, scheduling, parsing
-  test_runner.py         # execution, with a shell script standing in for the agent
+  test_orchestrator.py     # planning: globs, validation, scheduling, parsing
+  test_runner.py           # execution, with a shell script standing in for the agent
+  test_manifest.py         # per-acceptance-criterion verification
+  test_review_and_sync.py  # PR description, and the generated shims staying current
 ```
 
 ## Repository context files

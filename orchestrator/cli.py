@@ -10,10 +10,12 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
 from .config import ConfigError, load_config, write_template
 from .model import PlanError
 from .parse import load_plan
+from .review import build_description, collect_diff
 from .runner import Status, run_feature
 from .schedule import build_schedule
 from .validate import validate
@@ -52,6 +54,12 @@ def main(argv: list[str] | None = None) -> int:
     execute.add_argument("--json", action="store_true", help="machine-readable output")
     execute.add_argument("--config", default=None, help="path to config.json")
     execute.add_argument("--repo", default=".", help="repository root (default: .)")
+    execute.add_argument(
+        "--describe",
+        default=None,
+        metavar="PATH",
+        help="write a pull request description for the run to PATH ('-' for stdout)",
+    )
 
     init = subcommands.add_parser(
         "init", help="write a starter .agentteam/config.json"
@@ -163,9 +171,13 @@ def _run_execute(plan, args, *, as_json: bool) -> int:
             print(f"  {payload['outcome'].task_id}: merge conflict", flush=True)
 
     if not as_json:
+        if config.manifest_path:
+            verify = f"per acceptance criterion, from {config.manifest_path}"
+        else:
+            verify = config.verify_display() or "(none configured)"
         print(
             f"agent:  {' '.join(config.agent.command)}\n"
-            f"verify: {config.verify_display() or '(none configured)'}\n"
+            f"verify: {verify}\n"
             f"config: {config.source}"
         )
 
@@ -202,7 +214,27 @@ def _run_execute(plan, args, *, as_json: bool) -> int:
                 + ", ".join(o.task_id for o in held)
             )
 
+    if args.describe:
+        _write_description(plan, result, args, config)
+
     return 0 if result.ok else 1
+
+
+def _write_description(plan, result, args, config) -> None:
+    try:
+        diff = collect_diff(args.repo, config.base_ref, config.integration_branch)
+    except Exception:  # noqa: BLE001 - a missing branch must not lose the run's summary
+        diff = None
+
+    body = build_description(plan, result, diff)
+    if args.describe == "-":
+        print("\n" + body)
+        return
+    path = Path(args.describe)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    if not args.json:
+        print(f"\nwrote pull request description to {path}")
 
 
 if __name__ == "__main__":

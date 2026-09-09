@@ -26,6 +26,9 @@ class RunConfig:
     agent: AgentSpec
     verify_command: tuple[str, ...] = ()
     verify_timeout_seconds: int = 600
+    # When set, verification is per-acceptance-criterion via test-manifest.json rather
+    # than one whole-suite command, and `verify_command` becomes the fallback.
+    manifest_path: str = ""
     max_rounds: int = 3
     integration_branch: str = "agent/integration"
     base_ref: str = "HEAD"
@@ -127,6 +130,7 @@ def _from_mapping(raw: dict, *, source: str) -> RunConfig:
         agent=agent,
         verify_command=tuple(verify_command),
         verify_timeout_seconds=int(verify_raw.get("timeout_seconds", 600)),
+        manifest_path=str(verify_raw.get("manifest", "")),
         max_rounds=int(policy.get("max_rounds", 3)),
         integration_branch=str(policy.get("integration_branch", "agent/integration")),
         base_ref=str(policy.get("base_ref", "HEAD")),
@@ -154,6 +158,12 @@ TEMPLATE = {
     "verify": {
         "command": ["python3", "-m", "unittest", "discover", "-s", "tests"],
         "timeout_seconds": 600,
+        "_comment": (
+            "Set `manifest` to a test-manifest.json to verify per acceptance criterion "
+            "instead — a task then passes only when the tests for its own `covers` list "
+            "pass, and `command` is used only when no manifest is configured."
+        ),
+        "manifest": "",
     },
     "policy": {
         "max_rounds": 3,

@@ -144,10 +144,35 @@ class RetryTests(RunnerTestCase):
         self.assertEqual(outcome.status, Status.COMPLETED, outcome.detail)
         self.assertEqual(outcome.rounds, 2)
 
-    def test_rounds_are_bounded_and_the_failure_is_reported(self):
+    def test_identical_failure_twice_escalates_instead_of_retrying(self):
+        # The same failure twice means the last round changed nothing that mattered.
+        # Spending a third round on it is worse than handing it to a human.
         config = self.config(
             agent_body="mkdir -p src && echo nope > src/wrong.ts\n",
             verify_body='echo "expected src/thing.ts" >&2; exit 1\n',
+            max_rounds=5,
+        )
+        result = run_feature(
+            self.plan(Task(id="T1", title="never passes", owns=("src/**",))),
+            config,
+            repo=self.repo,
+        )
+
+        outcome = result.outcomes[0]
+        self.assertEqual(outcome.status, Status.ESCALATED)
+        self.assertEqual(outcome.rounds, 2, "should not have reached round 3")
+        # The failure text must survive to the caller — that is what a human debugs from.
+        self.assertIn("expected src/thing.ts", outcome.detail)
+
+    def test_rounds_are_bounded_when_the_failure_keeps_changing(self):
+        # A different failure each round is progress of a sort, so the guardrail stays
+        # out of the way and only max_rounds stops it.
+        counter = self.state / "verify-rounds"
+        config = self.config(
+            agent_body="mkdir -p src && echo nope > src/wrong.ts\n",
+            verify_body=f'C="{counter}"\n'
+            'N=$(cat "$C" 2>/dev/null || echo 0); N=$((N+1)); echo "$N" > "$C"\n'
+            'echo "distinct failure number $N" >&2; exit 1\n',
             max_rounds=2,
         )
         result = run_feature(
@@ -159,8 +184,24 @@ class RetryTests(RunnerTestCase):
         outcome = result.outcomes[0]
         self.assertEqual(outcome.status, Status.FAILED)
         self.assertEqual(outcome.rounds, 2)
-        # The failure text must survive to the caller — that is what a human debugs from.
-        self.assertIn("expected src/thing.ts", outcome.detail)
+        self.assertIn("distinct failure number 2", outcome.detail)
+
+    def test_volatile_output_does_not_look_like_a_new_failure(self):
+        # Timings and temp paths change every run. If they counted toward the signature,
+        # the escalation guardrail would never fire on a real test runner.
+        config = self.config(
+            agent_body="mkdir -p src && echo nope > src/wrong.ts\n",
+            verify_body='echo "failed in 0.$$s at /tmp/run-$$ — same cause" >&2; exit 1\n',
+            max_rounds=5,
+        )
+        result = run_feature(
+            self.plan(Task(id="T1", title="t", owns=("src/**",))),
+            config,
+            repo=self.repo,
+        )
+
+        self.assertEqual(result.outcomes[0].status, Status.ESCALATED)
+        self.assertEqual(result.outcomes[0].rounds, 2)
 
     def test_the_agent_is_told_what_failed_last_round(self):
         # The retry prompt has to carry the verification output, otherwise round two is

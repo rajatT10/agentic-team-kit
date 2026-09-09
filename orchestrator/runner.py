@@ -20,7 +20,8 @@ from pathlib import Path
 
 from .agent import AgentRun, build_prompt, run_agent
 from .config import RunConfig
-from .model import Plan
+from .manifest import Manifest, load_manifest, run_tests
+from .model import Plan, Task
 from .schedule import Assignment, Schedule, Wave, build_schedule
 from .worktree import (
     Worktree,
@@ -36,6 +37,7 @@ class Status(str, Enum):
     COMPLETED = "completed"  # verified and merged
     HELD = "held"  # verified, but withheld for human review
     FAILED = "failed"  # rounds exhausted, tests still failing
+    ESCALATED = "escalated"  # failed identically twice — a human is faster than round 3
     ERRORED = "errored"  # the agent could not be run at all
     CONFLICTED = "conflicted"  # verified, but would not merge
     SKIPPED = "skipped"  # an earlier wave stopped the run
@@ -49,6 +51,8 @@ class TaskOutcome:
     detail: str = ""
     branch: str = ""
     head: str = ""
+    # AC-n -> passed, when verification ran against a test manifest.
+    criteria: dict[str, bool] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -104,6 +108,9 @@ def run_feature(
     repo = Path(repo).resolve()
     schedule: Schedule = build_schedule(plan, worktree_root=config.worktree_root)
     emit = on_event or (lambda *_args, **_kwargs: None)
+    # Loaded once, up front: a malformed manifest should stop the run before any agent is
+    # dispatched, not after the first task has already written code.
+    manifest = load_manifest(config.manifest_path) if config.manifest_path else None
 
     base = git("rev-parse", config.base_ref, cwd=repo).stdout.strip()
     ensure_branch(repo, config.integration_branch, base)
@@ -129,7 +136,7 @@ def run_feature(
             continue
 
         emit("wave-start", wave=wave)
-        outcome = _run_wave(plan, wave, config, repo, emit)
+        outcome = _run_wave(plan, wave, config, repo, emit, manifest)
         result.waves.append(outcome)
         emit("wave-end", wave=wave, outcome=outcome)
 
@@ -140,14 +147,21 @@ def run_feature(
 
 
 def _run_wave(
-    plan: Plan, wave: Wave, config: RunConfig, repo: Path, emit
+    plan: Plan,
+    wave: Wave,
+    config: RunConfig,
+    repo: Path,
+    emit,
+    manifest: Manifest | None,
 ) -> WaveOutcome:
     workers = max(1, min(config.max_concurrency, len(wave.assignments)))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         outcomes = list(
             pool.map(
-                lambda assignment: _run_task(plan, assignment, config, repo, emit),
+                lambda assignment: _run_task(
+                    plan, assignment, config, repo, emit, manifest
+                ),
                 wave.assignments,
             )
         )
@@ -180,7 +194,12 @@ def _run_wave(
 
 
 def _run_task(
-    plan: Plan, assignment: Assignment, config: RunConfig, repo: Path, emit
+    plan: Plan,
+    assignment: Assignment,
+    config: RunConfig,
+    repo: Path,
+    emit,
+    manifest: Manifest | None = None,
 ) -> TaskOutcome:
     task = plan.by_id[assignment.task_id]
     outcome = TaskOutcome(
@@ -200,6 +219,7 @@ def _run_task(
         return outcome
 
     feedback = ""
+    previous_signature = ""
     for round_number in range(1, config.rounds + 1):
         outcome.rounds = round_number
         emit("round-start", task_id=task.id, round=round_number)
@@ -237,7 +257,8 @@ def _run_task(
         )
         outcome.head = tree.head()
 
-        verdict, detail = _verify(tree, config)
+        verdict, detail, signature, criteria = _verify(tree, config, manifest, task)
+        outcome.criteria = criteria
         emit("round-end", task_id=task.id, round=round_number, passed=verdict)
 
         if verdict:
@@ -252,6 +273,17 @@ def _run_task(
                 outcome.detail = ""
             return outcome
 
+        # Identical failure twice running means the last round changed nothing that
+        # mattered. A third attempt at the same wall is worse than asking a human.
+        if signature and signature == previous_signature:
+            outcome.status = Status.ESCALATED
+            outcome.detail = (
+                f"failed identically in rounds {round_number - 1} and {round_number}; "
+                f"escalating rather than retrying:\n{detail}"
+            )[:4000]
+            return outcome
+
+        previous_signature = signature
         feedback = detail
         outcome.detail = detail
 
@@ -260,16 +292,43 @@ def _run_task(
     return outcome
 
 
-def _verify(tree: Worktree, config: RunConfig) -> tuple[bool, str]:
-    """Run the verification command in the worktree.
+def _verify(
+    tree: Worktree, config: RunConfig, manifest: Manifest | None, task: Task
+) -> tuple[bool, str, str, dict[str, bool]]:
+    """Decide whether the task is done. Returns (passed, detail, signature, per-AC).
 
-    With no command configured there is nothing to check, and saying "passed" would be a
-    lie the rest of the run depends on — so the run is refused instead.
+    With a manifest, the exit condition is this task's own acceptance criteria — the red
+    tests for its `covers` list, plus every green test as a regression guard. Without one,
+    it falls back to a whole-suite command. With neither there is nothing to check, and
+    reporting "passed" would be a lie the rest of the run depends on, so it fails instead.
     """
+    if manifest is not None:
+        entries = manifest.for_criteria(task.covers) + manifest.regression_tests
+        if not entries:
+            return (
+                False,
+                f"{task.id} covers {list(task.covers) or '[]'}, none of which appear in "
+                f"{manifest.source}; there is no test that would prove it done",
+                "",
+                {},
+            )
+        report = run_tests(
+            manifest, entries, cwd=tree.path, timeout=config.verify_timeout_seconds
+        )
+        return (
+            report.passed,
+            report.describe(),
+            report.signature,
+            report.by_criterion(),
+        )
+
     if not config.verify_command:
-        return False, (
-            "no `verify.command` is configured, so there is no way to tell whether this "
-            "task is done; set one in .agentteam/config.json"
+        return (
+            False,
+            "no `verify.command` or `verify.manifest` is configured, so there is no way "
+            "to tell whether this task is done; set one in .agentteam/config.json",
+            "",
+            {},
         )
 
     try:
@@ -281,11 +340,27 @@ def _verify(tree: Worktree, config: RunConfig) -> tuple[bool, str]:
             timeout=config.verify_timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        return False, f"verification timed out after {config.verify_timeout_seconds}s"
+        return (
+            False,
+            f"verification timed out after {config.verify_timeout_seconds}s",
+            "timeout",
+            {},
+        )
     except FileNotFoundError as exc:
-        return False, f"verification command not found: {exc}"
+        return False, f"verification command not found: {exc}", "missing-command", {}
 
     if result.returncode == 0:
-        return True, ""
+        return True, "", "", {}
     combined = (result.stdout + "\n" + result.stderr).strip()
-    return False, combined[-4000:]
+    return False, combined[-4000:], _signature(combined), {}
+
+
+def _signature(output: str) -> str:
+    """Fingerprint a whole-suite failure the same way the manifest does per test."""
+    from .manifest import TestEntry, TestResult
+
+    return TestResult(
+        entry=TestEntry(ac_id="suite", file="", test_name=""),
+        passed=False,
+        output=output,
+    ).signature
